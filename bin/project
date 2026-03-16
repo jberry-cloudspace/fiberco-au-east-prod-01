@@ -4,6 +4,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECTS_DIR="$REPO_ROOT/docker/projects"
 TEMPLATE_DIR="$REPO_ROOT/docker/project-template"
+SHARED_NETWORK="fiberco-internal"
+
+ensure_shared_network() {
+    if ! docker network inspect "$SHARED_NETWORK" &>/dev/null; then
+        echo "Creating shared internal network '$SHARED_NETWORK'..."
+        docker network create "$SHARED_NETWORK"
+    fi
+}
 
 usage() {
     echo "Usage: project <command> <name> [options]"
@@ -56,6 +64,8 @@ PROJECT_NAME=$name
 APP_PORT=$port
 EOF
 
+    ensure_shared_network
+
     echo "Building and starting containers..."
     compose "$name" up -d --build
 
@@ -70,6 +80,7 @@ EOF
 }
 
 cmd_up() {
+    ensure_shared_network
     compose "$1" up -d
     echo "Project '$1' started."
 }

@@ -21,6 +21,7 @@ services:
         condition: service_healthy
     networks:
       - project-net
+      - fiberco-internal
 
   db:
     image: postgres:16-alpine
@@ -49,3 +50,5 @@ volumes:
 networks:
   project-net:
     name: ${PROJECT_NAME:-myproject}-net
+  fiberco-internal:
+    external: true

@@ -21,4 +21,4 @@ RUN useradd -m -s /bin/bash ${PROJECT_USER} \
 USER ${PROJECT_USER}
 WORKDIR /home/${PROJECT_USER}
 
-CMD ["/bin/bash"]
+CMD ["sleep", "infinity"]
