@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECTS_DIR="$REPO_ROOT/docker/projects"
 TEMPLATE_DIR="$REPO_ROOT/docker/project-template"
+NGINX_DIR="$REPO_ROOT/docker/nginx"
 SHARED_NETWORK="fiberco-internal"
 
 ensure_shared_network() {
@@ -17,7 +18,7 @@ usage() {
     echo "Usage: project <command> <name> [options]"
     echo ""
     echo "Commands:"
-    echo "  create <name> [--port PORT]   Create a new project container"
+    echo "  create <name>                 Create a new project container"
     echo "  up <name>                     Start a project"
     echo "  down <name>                   Stop a project"
     echo "  shell <name>                  Open a shell in the app container"
@@ -26,6 +27,9 @@ usage() {
     echo "  list                          List all projects"
     echo "  destroy <name>                Stop and remove a project (keeps volumes)"
     echo "  destroy <name> --volumes      Stop and remove a project AND its data"
+    echo "  nginx-up                      Start the nginx reverse proxy"
+    echo "  nginx-down                    Stop the nginx reverse proxy"
+    echo "  nginx-reload                  Reload nginx config (after adding routes)"
     exit 1
 }
 
@@ -38,16 +42,12 @@ compose() {
     docker compose -f "$(project_dir "$name")/docker-compose.yml" --env-file "$(project_dir "$name")/.env" "$@"
 }
 
+nginx_compose() {
+    docker compose -f "$NGINX_DIR/docker-compose.yml" "$@"
+}
+
 cmd_create() {
     local name="$1"; shift
-    local port=3000
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --port) port="$2"; shift 2 ;;
-            *) echo "Unknown option: $1"; exit 1 ;;
-        esac
-    done
 
     local dir="$PROJECTS_DIR/$name"
     if [[ -d "$dir" ]]; then
@@ -55,13 +55,13 @@ cmd_create() {
         exit 1
     fi
 
-    echo "Creating project '$name' on port $port..."
+    echo "Creating project '$name'..."
     mkdir -p "$dir"
     cp "$TEMPLATE_DIR/docker-compose.yml" "$dir/docker-compose.yml"
 
     cat > "$dir/.env" <<EOF
 PROJECT_NAME=$name
-APP_PORT=$port
+ANTHROPIC_API_KEY=
 EOF
 
     ensure_shared_network
@@ -71,12 +71,15 @@ EOF
 
     echo ""
     echo "Project '$name' is running!"
-    echo "  App container: ${name}-app (port $port)"
+    echo "  App container: ${name}-app"
     echo "  DB container:  ${name}-db (postgres)"
     echo ""
     echo "  Shell:  project shell $name"
     echo "  DB:     project db $name"
     echo "  Logs:   project logs $name"
+    echo ""
+    echo "  Set your API key: edit docker/projects/$name/.env"
+    echo "  Add nginx route:  docker/nginx/conf.d/${name}.conf"
 }
 
 cmd_up() {
@@ -115,9 +118,7 @@ cmd_list() {
             else
                 status="stopped"
             fi
-            local port
-            port=$(grep APP_PORT "$dir/.env" 2>/dev/null | cut -d= -f2 || echo "?")
-            echo "  $name  [$status]  port:$port"
+            echo "  $name  [$status]"
         done
     else
         echo "  (none)"
@@ -140,18 +141,37 @@ cmd_destroy() {
     echo "Project '$name' destroyed."
 }
 
+cmd_nginx_up() {
+    ensure_shared_network
+    nginx_compose up -d
+    echo "Nginx reverse proxy started on ports 80/443."
+}
+
+cmd_nginx_down() {
+    nginx_compose down
+    echo "Nginx reverse proxy stopped."
+}
+
+cmd_nginx_reload() {
+    docker exec fiberco-nginx nginx -s reload
+    echo "Nginx config reloaded."
+}
+
 [[ $# -lt 1 ]] && usage
 
 cmd="$1"; shift
 
 case "$cmd" in
-    create)  [[ $# -lt 1 ]] && usage; cmd_create "$@" ;;
-    up)      [[ $# -lt 1 ]] && usage; cmd_up "$1" ;;
-    down)    [[ $# -lt 1 ]] && usage; cmd_down "$1" ;;
-    shell)   [[ $# -lt 1 ]] && usage; cmd_shell "$1" ;;
-    db)      [[ $# -lt 1 ]] && usage; cmd_db "$1" ;;
-    logs)    [[ $# -lt 1 ]] && usage; cmd_logs "$1" ;;
-    list)    cmd_list ;;
-    destroy) [[ $# -lt 1 ]] && usage; cmd_destroy "$@" ;;
-    *)       usage ;;
+    create)       [[ $# -lt 1 ]] && usage; cmd_create "$@" ;;
+    up)           [[ $# -lt 1 ]] && usage; cmd_up "$1" ;;
+    down)         [[ $# -lt 1 ]] && usage; cmd_down "$1" ;;
+    shell)        [[ $# -lt 1 ]] && usage; cmd_shell "$1" ;;
+    db)           [[ $# -lt 1 ]] && usage; cmd_db "$1" ;;
+    logs)         [[ $# -lt 1 ]] && usage; cmd_logs "$1" ;;
+    list)         cmd_list ;;
+    destroy)      [[ $# -lt 1 ]] && usage; cmd_destroy "$@" ;;
+    nginx-up)     cmd_nginx_up ;;
+    nginx-down)   cmd_nginx_down ;;
+    nginx-reload) cmd_nginx_reload ;;
+    *)            usage ;;
 esac
