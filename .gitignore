@@ -1,0 +1,5 @@
+# Project environment files (contain ports, may contain secrets)
+docker/projects/*/.env
+
+# Keep the projects directory structure
+!docker/projects/.gitkeep
