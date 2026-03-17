@@ -1,0 +1,53 @@
+# Template: copy this directory as docker/projects/<project-name>/
+# Then run: docker compose -f docker/projects/<project-name>/docker-compose.yml up -d
+
+services:
+  app:
+    build:
+      context: ../../base
+      args:
+        PROJECT_USER: app
+    container_name: ${PROJECT_NAME:-myproject}-app
+    restart: unless-stopped
+    volumes:
+      - app-data:/home/app/code
+    environment:
+      - PROJECT_NAME=${PROJECT_NAME:-myproject}
+      - DATABASE_URL=postgres://app:app@db:5432/${PROJECT_NAME:-myproject}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - project-net
+      - fiberco-internal
+
+  db:
+    image: postgres:16-alpine
+    container_name: ${PROJECT_NAME:-myproject}-db
+    restart: unless-stopped
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=app
+      - POSTGRES_DB=${PROJECT_NAME:-myproject}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d ${PROJECT_NAME:-myproject}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - project-net
+
+volumes:
+  app-data:
+    name: ${PROJECT_NAME:-myproject}-app-data
+  db-data:
+    name: ${PROJECT_NAME:-myproject}-db-data
+
+networks:
+  project-net:
+    name: ${PROJECT_NAME:-myproject}-net
+  fiberco-internal:
+    external: true

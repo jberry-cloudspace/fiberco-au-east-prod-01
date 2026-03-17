@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: fiberco-tracker-db
+    restart: unless-stopped
+    volumes:
+      - tracker-data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    environment:
+      - POSTGRES_USER=tracker
+      - POSTGRES_PASSWORD=tracker
+      - POSTGRES_DB=tracker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tracker -d tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fiberco-internal
+
+volumes:
+  tracker-data:
+    name: fiberco-tracker-data
+
+networks:
+  fiberco-internal:
+    external: true

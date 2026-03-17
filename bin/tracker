@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Tracker CLI — connects to fiberco-tracker-db
+# Works from host or inside any container on fiberco-internal network
+
+TRACKER_DB_HOST="${TRACKER_DB_HOST:-fiberco-tracker-db}"
+TRACKER_DB_PORT="${TRACKER_DB_PORT:-5432}"
+TRACKER_DB_USER="${TRACKER_DB_USER:-tracker}"
+TRACKER_DB_NAME="${TRACKER_DB_NAME:-tracker}"
+PGPASSWORD="${TRACKER_DB_PASS:-tracker}"
+export PGPASSWORD
+
+psql_cmd() {
+    # From host, use docker exec; from container, use psql directly
+    if command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^fiberco-tracker-db$'; then
+        docker exec -i fiberco-tracker-db psql -U "$TRACKER_DB_USER" -d "$TRACKER_DB_NAME" -t -A "$@"
+    else
+        psql -h "$TRACKER_DB_HOST" -p "$TRACKER_DB_PORT" -U "$TRACKER_DB_USER" -d "$TRACKER_DB_NAME" -t -A "$@"
+    fi
+}
+
+psql_fmt() {
+    if command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^fiberco-tracker-db$'; then
+        docker exec -i fiberco-tracker-db psql -U "$TRACKER_DB_USER" -d "$TRACKER_DB_NAME" "$@"
+    else
+        psql -h "$TRACKER_DB_HOST" -p "$TRACKER_DB_PORT" -U "$TRACKER_DB_USER" -d "$TRACKER_DB_NAME" "$@"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Usage: tracker <command> [options]
+
+Task Management:
+  create <title> [options]          Create a new task
+    --project <name>                Project name (e.g., fiberco-website)
+    --type <feature|bug|change>     Task type (default: feature)
+    --priority <p0|p1|p2|p3>        Priority (default: p2)
+    --assignee <name>               Assignee
+    --epic <code>                   Epic code
+    --description <text>            Description
+
+  update <code> [options]           Update a task
+    --status <status>               triage|backlog|todo|in_progress|in_review|done|cancelled
+    --priority <p0|p1|p2|p3>        Priority
+    --assignee <name>               Assignee
+    --title <text>                  Title
+    --description <text>            Description
+
+  show <code>                       Show task details
+  list [options]                    List tasks
+    --project <name>                Filter by project
+    --status <status>               Filter by status
+    --assignee <name>               Filter by assignee
+    --type <type>                   Filter by type
+
+  board [--project <name>]          Show kanban board view
+
+  comment <code> <message>          Add a comment to a task
+  log-time <code> <minutes> [note]  Log time spent on a task
+
+Epic Management:
+  epic-create <title> --project <name>  Create an epic
+  epic-list [--project <name>]          List epics
+
+Session Continuity:
+  session-start <task-code> [objective]     Start a session on a task
+  session-update <task-code> [options]      Update session state
+    --completed <item>                      Mark something completed
+    --decision <decision>                   Record a decision
+    --blocker <blocker>                     Record a blocker
+    --next <step>                           Record a next step
+    --error <error>                         Record error state
+    --in-progress <item>                    What's being worked on now
+  session-end <task-code>                   End a session
+  session-handoff [task-code|project]       Get handoff briefing for resumption
+
+Board Statuses: triage → backlog → todo → in_progress → in_review → done | cancelled
+EOF
+    exit 1
+}
+
+cmd_create() {
+    local title="" project="" type="feature" priority="p2" assignee="" epic="" description=""
+
+    # First arg is title
+    [[ $# -lt 1 ]] && usage
+    title="$1"; shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project) project="$2"; shift 2 ;;
+            --type) type="$2"; shift 2 ;;
+            --priority) priority="$2"; shift 2 ;;
+            --assignee) assignee="$2"; shift 2 ;;
+            --epic) epic="$2"; shift 2 ;;
+            --description) description="$2"; shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    local project_clause="NULL"
+    if [[ -n "$project" ]]; then
+        project_clause="(SELECT id FROM projects WHERE name = '$project')"
+    fi
+
+    local epic_clause="NULL"
+    if [[ -n "$epic" ]]; then
+        epic_clause="(SELECT id FROM epics WHERE code = '$epic')"
+    fi
+
+    local assignee_clause="NULL"
+    if [[ -n "$assignee" ]]; then
+        assignee_clause="'$assignee'"
+    fi
+
+    local desc_clause="NULL"
+    if [[ -n "$description" ]]; then
+        desc_clause="'$(echo "$description" | sed "s/'/''/g")'"
+    fi
+
+    local safe_title
+    safe_title=$(echo "$title" | sed "s/'/''/g")
+
+    local code
+    code=$(psql_cmd -c "
+        INSERT INTO tasks (title, project_id, type, priority, assignee, epic_id, description)
+        VALUES ('$safe_title', $project_clause, '$type', '$priority', $assignee_clause, $epic_clause, $desc_clause)
+        RETURNING code;
+    " | grep -oP 'FIB-\d+')
+
+    echo "Created $code: $title"
+}
+
+cmd_update() {
+    local code="$1"; shift
+    local sets=()
+    local changelog_entries=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status)
+                local old_val
+                old_val=$(psql_cmd -c "SELECT status FROM tasks WHERE code = '$code';" | tr -d '[:space:]')
+                sets+=("status = '$2'")
+                changelog_entries+=("INSERT INTO task_changelog (task_id, field_name, old_value, new_value, changed_by) VALUES ((SELECT id FROM tasks WHERE code = '$code'), 'status', '$old_val', '$2', 'cli');")
+                shift 2 ;;
+            --priority)
+                local old_val
+                old_val=$(psql_cmd -c "SELECT priority FROM tasks WHERE code = '$code';" | tr -d '[:space:]')
+                sets+=("priority = '$2'")
+                changelog_entries+=("INSERT INTO task_changelog (task_id, field_name, old_value, new_value, changed_by) VALUES ((SELECT id FROM tasks WHERE code = '$code'), 'priority', '$old_val', '$2', 'cli');")
+                shift 2 ;;
+            --assignee)
+                local old_val
+                old_val=$(psql_cmd -c "SELECT COALESCE(assignee, '') FROM tasks WHERE code = '$code';" | tr -d '[:space:]')
+                sets+=("assignee = '$2'")
+                changelog_entries+=("INSERT INTO task_changelog (task_id, field_name, old_value, new_value, changed_by) VALUES ((SELECT id FROM tasks WHERE code = '$code'), 'assignee', '$old_val', '$2', 'cli');")
+                shift 2 ;;
+            --title)
+                local safe_title
+                safe_title=$(echo "$2" | sed "s/'/''/g")
+                sets+=("title = '$safe_title'")
+                shift 2 ;;
+            --description)
+                local safe_desc
+                safe_desc=$(echo "$2" | sed "s/'/''/g")
+                sets+=("description = '$safe_desc'")
+                shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    if [[ ${#sets[@]} -eq 0 ]]; then
+        echo "Nothing to update."
+        exit 1
+    fi
+
+    local set_clause
+    set_clause=$(IFS=','; echo "${sets[*]}")
+
+    psql_cmd -c "UPDATE tasks SET $set_clause, updated_by = 'cli' WHERE code = '$code';" 2>&1 | grep -v '^UPDATE\|^INSERT' > /dev/null || true
+
+    for entry in "${changelog_entries[@]}"; do
+        psql_cmd -c "$entry" > /dev/null
+    done
+
+    echo "Updated $code"
+}
+
+cmd_show() {
+    local code="$1"
+    psql_fmt -c "
+        SELECT
+            t.code AS \"Code\",
+            t.title AS \"Title\",
+            t.type AS \"Type\",
+            t.status AS \"Status\",
+            t.priority AS \"Priority\",
+            COALESCE(p.name, '-') AS \"Project\",
+            COALESCE(t.assignee, '-') AS \"Assignee\",
+            COALESCE(e.code, '-') AS \"Epic\",
+            COALESCE(t.branch_name, '-') AS \"Branch\",
+            COALESCE(t.pr_url, '-') AS \"PR\",
+            COALESCE(t.estimate_hours::TEXT, '-') AS \"Est. Hours\",
+            COALESCE((SELECT SUM(duration_minutes) FROM time_logs WHERE task_id = t.id)::TEXT || ' min', '0 min') AS \"Time Spent\",
+            to_char(t.created_at, 'YYYY-MM-DD HH24:MI') AS \"Created\",
+            COALESCE(to_char(t.started_at, 'YYYY-MM-DD HH24:MI'), '-') AS \"Started\",
+            COALESCE(to_char(t.completed_at, 'YYYY-MM-DD HH24:MI'), '-') AS \"Completed\"
+        FROM tasks t
+        LEFT JOIN projects p ON t.project_id = p.id
+        LEFT JOIN epics e ON t.epic_id = e.id
+        WHERE t.code = '$code';
+    "
+
+    echo ""
+    echo "--- Description ---"
+    psql_cmd -c "SELECT COALESCE(description, '(none)') FROM tasks WHERE code = '$code';"
+
+    local has_comments
+    has_comments=$(psql_cmd -c "SELECT COUNT(*) FROM comments c JOIN tasks t ON c.task_id = t.id WHERE t.code = '$code';" | tr -d '[:space:]')
+    if [[ "$has_comments" -gt 0 ]]; then
+        echo ""
+        echo "--- Comments ---"
+        psql_fmt -c "
+            SELECT to_char(c.created_at, 'YYYY-MM-DD HH24:MI') AS \"When\",
+                   c.author AS \"Who\",
+                   c.body AS \"Comment\"
+            FROM comments c JOIN tasks t ON c.task_id = t.id
+            WHERE t.code = '$code'
+            ORDER BY c.created_at;
+        "
+    fi
+}
+
+cmd_list() {
+    local where_clauses=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project) where_clauses+=("p.name = '$2'"); shift 2 ;;
+            --status) where_clauses+=("t.status = '$2'"); shift 2 ;;
+            --assignee) where_clauses+=("t.assignee = '$2'"); shift 2 ;;
+            --type) where_clauses+=("t.type = '$2'"); shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    local where=""
+    if [[ ${#where_clauses[@]} -gt 0 ]]; then
+        where="WHERE $(IFS=' AND '; echo "${where_clauses[*]}")"
+    fi
+
+    psql_fmt -c "
+        SELECT
+            t.code AS \"Code\",
+            t.type AS \"Type\",
+            t.status AS \"Status\",
+            t.priority AS \"Pri\",
+            COALESCE(p.name, '-') AS \"Project\",
+            COALESCE(t.assignee, '-') AS \"Assignee\",
+            COALESCE((SELECT SUM(duration_minutes) FROM time_logs WHERE task_id = t.id)::TEXT || 'm', '-') AS \"Time\",
+            LEFT(t.title, 60) AS \"Title\"
+        FROM tasks t
+        LEFT JOIN projects p ON t.project_id = p.id
+        $where
+        ORDER BY
+            CASE t.priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 WHEN 'p3' THEN 3 END,
+            t.created_at DESC;
+    "
+}
+
+cmd_board() {
+    local project_filter=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project) project_filter="AND p.name = '$2'"; shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    for status in triage backlog todo in_progress in_review done; do
+        local label
+        case $status in
+            triage)      label="TRIAGE" ;;
+            backlog)     label="BACKLOG" ;;
+            todo)        label="TODO" ;;
+            in_progress) label="IN PROGRESS" ;;
+            in_review)   label="IN REVIEW" ;;
+            done)        label="DONE (recent)" ;;
+        esac
+
+        local limit=""
+        [[ "$status" == "done" ]] && limit="LIMIT 10"
+
+        echo ""
+        echo "═══ $label ═══"
+        psql_cmd -F '|' -c "
+            SELECT t.code, t.priority, COALESCE(p.name, '-'), LEFT(t.title, 50)
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            WHERE t.status = '$status' $project_filter
+            ORDER BY
+                CASE t.priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 WHEN 'p3' THEN 3 END,
+                t.created_at DESC
+            $limit;
+        " | while IFS='|' read -r code pri proj title; do
+            [[ -z "$code" ]] && continue
+            printf "  %-10s %-3s %-18s %s\n" "$code" "$pri" "$proj" "$title"
+        done
+    done
+    echo ""
+}
+
+cmd_comment() {
+    local code="$1"
+    local body
+    body=$(echo "$2" | sed "s/'/''/g")
+
+    psql_cmd -c "
+        INSERT INTO comments (task_id, author, body)
+        VALUES ((SELECT id FROM tasks WHERE code = '$code'), 'cli', '$body');
+    " > /dev/null
+
+    echo "Comment added to $code"
+}
+
+cmd_log_time() {
+    local code="$1"
+    local minutes="$2"
+    local note="${3:-}"
+    local safe_note
+    safe_note=$(echo "$note" | sed "s/'/''/g")
+
+    local note_clause="NULL"
+    [[ -n "$safe_note" ]] && note_clause="'$safe_note'"
+
+    psql_cmd -c "
+        INSERT INTO time_logs (task_id, logged_by, duration_minutes, note)
+        VALUES ((SELECT id FROM tasks WHERE code = '$code'), 'cli', $minutes, $note_clause);
+    " > /dev/null
+
+    echo "Logged ${minutes}m on $code"
+}
+
+cmd_epic_create() {
+    local title="$1"; shift
+    local project=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project) project="$2"; shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    [[ -z "$project" ]] && echo "Error: --project is required" && exit 1
+
+    local safe_title
+    safe_title=$(echo "$title" | sed "s/'/''/g")
+
+    # Generate epic code from project prefix
+    local prefix
+    prefix=$(echo "$project" | sed 's/fiberco-//' | tr '[:lower:]' '[:upper:]' | cut -c1-4)
+    local next_num
+    next_num=$(psql_cmd -c "SELECT COALESCE(MAX(CAST(SUBSTRING(code FROM '[0-9]+$') AS INTEGER)), 0) + 1 FROM epics WHERE code LIKE '${prefix}-%';" | tr -d '[:space:]')
+    local epic_code="${prefix}-E${next_num}"
+
+    psql_cmd -c "
+        INSERT INTO epics (code, title, project_id)
+        VALUES ('$epic_code', '$safe_title', (SELECT id FROM projects WHERE name = '$project'))
+        RETURNING code;
+    " | tr -d '[:space:]'
+
+    echo "Created epic $epic_code: $title"
+}
+
+cmd_epic_list() {
+    local where=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --project) where="WHERE p.name = '$2'"; shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    psql_fmt -c "
+        SELECT e.code AS \"Code\",
+               e.status AS \"Status\",
+               COALESCE(p.name, '-') AS \"Project\",
+               e.title AS \"Title\",
+               (SELECT COUNT(*) FROM tasks t WHERE t.epic_id = e.id) AS \"Tasks\"
+        FROM epics e
+        LEFT JOIN projects p ON e.project_id = p.id
+        $where
+        ORDER BY e.created_at DESC;
+    "
+}
+
+cmd_session_start() {
+    local code="$1"
+    local objective="${2:-Working on $code}"
+    local safe_obj
+    safe_obj=$(echo "$objective" | sed "s/'/''/g")
+
+    # Close any existing active sessions for this task
+    psql_cmd -c "UPDATE session_logs SET status = 'ended' WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';" > /dev/null
+
+    psql_cmd -c "
+        INSERT INTO session_logs (task_id, project_id, objective, container_name)
+        SELECT t.id, t.project_id, '$safe_obj', p.container_name
+        FROM tasks t
+        LEFT JOIN projects p ON t.project_id = p.id
+        WHERE t.code = '$code';
+    " > /dev/null
+
+    # Auto-move task to in_progress if it's in todo/backlog/triage
+    local current_status
+    current_status=$(psql_cmd -c "SELECT status FROM tasks WHERE code = '$code';" | tr -d '[:space:]')
+    if [[ "$current_status" =~ ^(triage|backlog|todo)$ ]]; then
+        psql_cmd -c "
+            INSERT INTO task_changelog (task_id, field_name, old_value, new_value, changed_by, change_source)
+            VALUES ((SELECT id FROM tasks WHERE code = '$code'), 'status', '$current_status', 'in_progress', 'session', 'ai-agent');
+            UPDATE tasks SET status = 'in_progress', updated_by = 'session' WHERE code = '$code';
+        " > /dev/null
+    fi
+
+    echo "Session started on $code: $objective"
+}
+
+cmd_session_update() {
+    local code="$1"; shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --completed)
+                local safe_val
+                safe_val=$(echo "$2" | sed "s/'/''/g" | sed 's/"/\\"/g')
+                psql_cmd -c "
+                    UPDATE session_logs SET completed_items = completed_items || '[\"$safe_val\"]'::jsonb
+                    WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+                " > /dev/null
+                shift 2 ;;
+            --decision)
+                local safe_val
+                safe_val=$(echo "$2" | sed "s/'/''/g" | sed 's/"/\\"/g')
+                psql_cmd -c "
+                    UPDATE session_logs SET decisions = decisions || '[\"$safe_val\"]'::jsonb
+                    WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+                " > /dev/null
+                shift 2 ;;
+            --blocker)
+                local safe_val
+                safe_val=$(echo "$2" | sed "s/'/''/g" | sed 's/"/\\"/g')
+                psql_cmd -c "
+                    UPDATE session_logs SET blockers = blockers || '[\"$safe_val\"]'::jsonb
+                    WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+                " > /dev/null
+                shift 2 ;;
+            --next)
+                local safe_val
+                safe_val=$(echo "$2" | sed "s/'/''/g" | sed 's/"/\\"/g')
+                psql_cmd -c "
+                    UPDATE session_logs SET next_steps = next_steps || '[\"$safe_val\"]'::jsonb
+                    WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+                " > /dev/null
+                shift 2 ;;
+            --error)
+                local safe_val
+                safe_val=$(echo "$2" | sed "s/'/''/g")
+                psql_cmd -c "
+                    UPDATE session_logs SET error_state = '$safe_val'
+                    WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+                " > /dev/null
+                shift 2 ;;
+            --in-progress)
+                local safe_val
+                safe_val=$(echo "$2" | sed "s/'/''/g")
+                psql_cmd -c "
+                    UPDATE session_logs SET in_progress_item = '$safe_val'
+                    WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+                " > /dev/null
+                shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    echo "Session updated for $code"
+}
+
+cmd_session_end() {
+    local code="$1"
+    psql_cmd -c "
+        UPDATE session_logs SET status = 'ended'
+        WHERE task_id = (SELECT id FROM tasks WHERE code = '$code') AND status = 'active';
+    " > /dev/null
+    echo "Session ended for $code"
+}
+
+cmd_session_handoff() {
+    local filter="$1"
+
+    # Check if it's a task code or project name
+    local where_clause
+    if [[ "$filter" =~ ^FIB- ]]; then
+        where_clause="t.code = '$filter'"
+    else
+        where_clause="p.name = '$filter'"
+    fi
+
+    echo "═══ SESSION HANDOFF BRIEFING ═══"
+    echo ""
+
+    # Show active/recent sessions
+    psql_fmt -c "
+        SELECT
+            t.code AS \"Task\",
+            t.status AS \"Status\",
+            t.priority AS \"Pri\",
+            t.title AS \"Title\",
+            COALESCE(p.name, '-') AS \"Project\",
+            s.objective AS \"Objective\",
+            s.in_progress_item AS \"In Progress\",
+            s.error_state AS \"Error State\"
+        FROM session_logs s
+        JOIN tasks t ON s.task_id = t.id
+        LEFT JOIN projects p ON t.project_id = p.id
+        WHERE $where_clause AND s.status IN ('active', 'ended')
+        ORDER BY s.updated_at DESC
+        LIMIT 5;
+    "
+
+    # Show latest session details
+    echo ""
+    echo "--- Latest Session Details ---"
+    psql_cmd -c "
+        SELECT
+            'Completed: ' || completed_items::TEXT ||
+            E'\nDecisions: ' || decisions::TEXT ||
+            E'\nBlockers: ' || blockers::TEXT ||
+            E'\nNext Steps: ' || next_steps::TEXT
+        FROM session_logs s
+        JOIN tasks t ON s.task_id = t.id
+        LEFT JOIN projects p ON t.project_id = p.id
+        WHERE $where_clause
+        ORDER BY s.updated_at DESC
+        LIMIT 1;
+    "
+
+    # Show all in-progress tasks for context
+    echo ""
+    echo "--- All In-Progress Tasks ---"
+    psql_fmt -c "
+        SELECT t.code AS \"Code\", t.priority AS \"Pri\", COALESCE(p.name, '-') AS \"Project\", t.title AS \"Title\"
+        FROM tasks t
+        LEFT JOIN projects p ON t.project_id = p.id
+        WHERE t.status = 'in_progress'
+        ORDER BY CASE t.priority WHEN 'p0' THEN 0 WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 WHEN 'p3' THEN 3 END;
+    "
+}
+
+# --- Main ---
+[[ $# -lt 1 ]] && usage
+
+cmd="$1"; shift
+
+case "$cmd" in
+    create)          [[ $# -lt 1 ]] && usage; cmd_create "$@" ;;
+    update)          [[ $# -lt 1 ]] && usage; cmd_update "$@" ;;
+    show)            [[ $# -lt 1 ]] && usage; cmd_show "$1" ;;
+    list)            cmd_list "$@" ;;
+    board)           cmd_board "$@" ;;
+    comment)         [[ $# -lt 2 ]] && usage; cmd_comment "$1" "$2" ;;
+    log-time)        [[ $# -lt 2 ]] && usage; cmd_log_time "$@" ;;
+    epic-create)     [[ $# -lt 1 ]] && usage; cmd_epic_create "$@" ;;
+    epic-list)       cmd_epic_list "$@" ;;
+    session-start)   [[ $# -lt 1 ]] && usage; cmd_session_start "$@" ;;
+    session-update)  [[ $# -lt 1 ]] && usage; cmd_session_update "$@" ;;
+    session-end)     [[ $# -lt 1 ]] && usage; cmd_session_end "$1" ;;
+    session-handoff) [[ $# -lt 1 ]] && usage; cmd_session_handoff "$1" ;;
+    help|--help|-h)  usage ;;
+    *)               echo "Unknown command: $cmd"; usage ;;
+esac

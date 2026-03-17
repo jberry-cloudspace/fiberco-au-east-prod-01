@@ -1,3 +1,6 @@
+# Host-level secrets
+.env
+
 # Project environment files (contain ports, may contain secrets)
 docker/projects/*/.env
 

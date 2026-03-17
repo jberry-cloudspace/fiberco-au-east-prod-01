@@ -51,9 +51,20 @@ ARG PROJECT_USER=app
 RUN useradd -m -s /bin/bash ${PROJECT_USER} \
     && echo "${PROJECT_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${PROJECT_USER}
 
-# Clone superpowers into user home
+# Copy tracker CLI
+COPY tracker /usr/local/bin/tracker
+RUN chmod +x /usr/local/bin/tracker
+
+# Create non-root user home structure
 USER ${PROJECT_USER}
 RUN git clone https://github.com/obra/superpowers.git /home/${PROJECT_USER}/.superpowers
+
+# Tracker environment
+ENV TRACKER_DB_HOST=fiberco-tracker-db
+ENV TRACKER_DB_PORT=5432
+ENV TRACKER_DB_USER=tracker
+ENV TRACKER_DB_NAME=tracker
+ENV TRACKER_DB_PASS=tracker
 
 WORKDIR /home/${PROJECT_USER}/code
 

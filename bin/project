@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECTS_DIR="$REPO_ROOT/docker/projects"
 TEMPLATE_DIR="$REPO_ROOT/docker/project-template"
 NGINX_DIR="$REPO_ROOT/docker/nginx"
+TRACKER_DIR="$REPO_ROOT/docker/tracker"
 SHARED_NETWORK="fiberco-internal"
 
 ensure_shared_network() {
@@ -30,6 +31,10 @@ usage() {
     echo "  nginx-up                      Start the nginx reverse proxy"
     echo "  nginx-down                    Stop the nginx reverse proxy"
     echo "  nginx-reload                  Reload nginx config (after adding routes)"
+    echo "  tracker-up                    Start the tracker database"
+    echo "  tracker-down                  Stop the tracker database"
+    echo "  start-all                     Start nginx, tracker, and all projects"
+    echo "  stop-all                      Stop everything"
     exit 1
 }
 
@@ -157,6 +162,58 @@ cmd_nginx_reload() {
     echo "Nginx config reloaded."
 }
 
+tracker_compose() {
+    docker compose -f "$TRACKER_DIR/docker-compose.yml" "$@"
+}
+
+cmd_tracker_up() {
+    ensure_shared_network
+    tracker_compose up -d
+    echo "Tracker database started."
+}
+
+cmd_tracker_down() {
+    tracker_compose down
+    echo "Tracker database stopped."
+}
+
+cmd_start_all() {
+    ensure_shared_network
+    echo "Starting tracker..."
+    tracker_compose up -d
+    echo "Starting nginx..."
+    nginx_compose up -d
+    echo "Starting projects..."
+    if [[ -d "$PROJECTS_DIR" ]]; then
+        for dir in "$PROJECTS_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            local name
+            name=$(basename "$dir")
+            echo "  Starting $name..."
+            compose "$name" up -d
+        done
+    fi
+    echo "All services started."
+}
+
+cmd_stop_all() {
+    echo "Stopping projects..."
+    if [[ -d "$PROJECTS_DIR" ]]; then
+        for dir in "$PROJECTS_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            local name
+            name=$(basename "$dir")
+            echo "  Stopping $name..."
+            compose "$name" down
+        done
+    fi
+    echo "Stopping nginx..."
+    nginx_compose down
+    echo "Stopping tracker..."
+    tracker_compose down
+    echo "All services stopped."
+}
+
 [[ $# -lt 1 ]] && usage
 
 cmd="$1"; shift
@@ -173,5 +230,9 @@ case "$cmd" in
     nginx-up)     cmd_nginx_up ;;
     nginx-down)   cmd_nginx_down ;;
     nginx-reload) cmd_nginx_reload ;;
+    tracker-up)   cmd_tracker_up ;;
+    tracker-down) cmd_tracker_down ;;
+    start-all)    cmd_start_all ;;
+    stop-all)     cmd_stop_all ;;
     *)            usage ;;
 esac
