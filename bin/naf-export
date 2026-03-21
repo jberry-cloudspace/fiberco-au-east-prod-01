@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Export the fiberco-naf project as a portable package for import on another VM
+# Usage: bin/naf-export [output-dir]
+#
+# Creates a self-contained directory with:
+#   - Database dump (pg_dump, compressed)
+#   - App code from the volume
+#   - Docker compose + config files
+#   - Import script + G-NAF update script
+#   - nginx config template
+#   - Import/setup instructions
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUTPUT_DIR="${1:-/tmp/fiberco-naf-export}"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+EXPORT_DIR="$OUTPUT_DIR/fiberco-naf-$TIMESTAMP"
+
+echo "=== Fiberco NAF Export ==="
+echo "Output: $EXPORT_DIR"
+echo ""
+
+mkdir -p "$EXPORT_DIR"/{docker,sql,app,nginx,bin}
+
+# ── 1. Database dump ────────────────────────────────────────────────
+echo "[1/6] Dumping database (this may take a while — 22GB+ of data)..."
+docker exec fiberco-naf-db pg_dump -U app -d fiberco-naf \
+    --no-owner --no-privileges \
+    -Fc -Z 6 \
+    -f /tmp/fiberco-naf-export.dump
+
+docker cp fiberco-naf-db:/tmp/fiberco-naf-export.dump "$EXPORT_DIR/sql/fiberco-naf.dump"
+docker exec fiberco-naf-db rm /tmp/fiberco-naf-export.dump
+
+DUMP_SIZE=$(ls -lh "$EXPORT_DIR/sql/fiberco-naf.dump" | awk '{print $5}')
+echo "  Database dump: $DUMP_SIZE"
+
+# ── 2. App code ─────────────────────────────────────────────────────
+echo "[2/6] Extracting app code from volume..."
+docker cp fiberco-naf-app:/home/app/code/. "$EXPORT_DIR/app/"
+# Remove pycache
+rm -rf "$EXPORT_DIR/app/__pycache__"
+echo "  Done."
+
+# ── 3. Docker config ────────────────────────────────────────────────
+echo "[3/6] Copying Docker config..."
+cp "$REPO_ROOT/docker/projects/fiberco-naf/docker-compose.yml" "$EXPORT_DIR/docker/"
+cp "$REPO_ROOT/docker/projects/fiberco-naf/import-gnaf.sh" "$EXPORT_DIR/docker/"
+cp -r "$REPO_ROOT/docker/projects/fiberco-naf/sql" "$EXPORT_DIR/docker/sql"
+
+cat > "$EXPORT_DIR/docker/.env" <<'EOF'
+PROJECT_NAME=fiberco-naf
+ANTHROPIC_API_KEY=
+EOF
+echo "  Done."
+
+# ── 4. Nginx config ─────────────────────────────────────────────────
+echo "[4/6] Generating nginx config..."
+cat > "$EXPORT_DIR/nginx/fiberco-naf.conf" <<'NGINX'
+server {
+    listen 443 ssl;
+    server_name naf.fiberco.com.au;
+
+    ssl_certificate /etc/letsencrypt/live/naf.fiberco.com.au/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/naf.fiberco.com.au/privkey.pem;
+
+    location / {
+        proxy_pass http://fiberco-naf-app:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+
+server {
+    listen 80;
+    server_name naf.fiberco.com.au;
+    return 301 https://$host$request_uri;
+}
+NGINX
+echo "  Done."
+
+# ── 5. G-NAF update script ──────────────────────────────────────────
+echo "[5/6] Copying update scripts..."
+cp "$REPO_ROOT/bin/gnaf-update" "$EXPORT_DIR/bin/"
+chmod +x "$EXPORT_DIR/bin/gnaf-update"
+echo "  Done."
+
+# ── 6. Import script ────────────────────────────────────────────────
+echo "[6/6] Generating import script..."
+cat > "$EXPORT_DIR/naf-import" <<'IMPORT'
+#!/usr/bin/env bash
+# Import fiberco-naf onto a new VM
+# Usage: ./naf-import [--network NETWORK_NAME] [--standalone]
+#
+# Modes:
+#   Default:      Joins an existing fiberco-internal network (for multi-project VMs)
+#   --standalone: Creates its own isolated network (for single-service VMs)
+#   --network X:  Joins a custom external network name
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NETWORK="fiberco-internal"
+STANDALONE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --network) NETWORK="$2"; shift 2 ;;
+        --standalone) STANDALONE=true; NETWORK="fiberco-naf-standalone"; shift ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+echo "=== Fiberco NAF Import ==="
+echo ""
+
+# ── Prerequisites ───────────────────────────────────────────────────
+for cmd in docker; do
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "ERROR: $cmd is required but not installed."
+        exit 1
+    fi
+done
+
+if ! docker compose version &>/dev/null; then
+    echo "ERROR: docker compose (v2) is required."
+    exit 1
+fi
+
+# ── Network ─────────────────────────────────────────────────────────
+echo "[1/5] Setting up Docker network '$NETWORK'..."
+if ! docker network inspect "$NETWORK" &>/dev/null 2>&1; then
+    docker network create "$NETWORK"
+    echo "  Created network '$NETWORK'"
+else
+    echo "  Network '$NETWORK' already exists"
+fi
+
+# Update docker-compose to use the right network name
+if [ "$NETWORK" != "fiberco-internal" ]; then
+    sed -i "s/fiberco-internal/$NETWORK/g" "$SCRIPT_DIR/docker/docker-compose.yml"
+    echo "  Updated docker-compose.yml to use '$NETWORK'"
+fi
+
+# ── Build base image if needed ──────────────────────────────────────
+echo "[2/5] Preparing containers..."
+
+# Check if we need a Dockerfile — create a minimal one if the base context isn't available
+COMPOSE_DIR="$SCRIPT_DIR/docker"
+if [ ! -d "$COMPOSE_DIR/../../base" ]; then
+    echo "  Base image context not found — creating standalone Dockerfile..."
+    mkdir -p "$COMPOSE_DIR/base"
+
+    cat > "$COMPOSE_DIR/base/Dockerfile" <<'DOCKERFILE'
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    curl wget git python3 python3-pip python3-venv \
+    postgresql-client jq unzip sudo \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*
+ARG PROJECT_USER=app
+RUN useradd -m -s /bin/bash ${PROJECT_USER} \
+    && echo "${PROJECT_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${PROJECT_USER}
+USER ${PROJECT_USER}
+WORKDIR /home/${PROJECT_USER}/code
+CMD ["sleep", "infinity"]
+DOCKERFILE
+
+    # Point docker-compose build context at our local base
+    sed -i 's|context: ../../base|context: ./base|g' "$COMPOSE_DIR/docker-compose.yml"
+    echo "  Created standalone Dockerfile"
+fi
+
+# Start containers (db first for health check)
+docker compose -f "$COMPOSE_DIR/docker-compose.yml" --env-file "$COMPOSE_DIR/.env" up -d --build
+echo "  Containers started"
+
+# Wait for database to be healthy
+echo "  Waiting for database to be healthy..."
+for i in $(seq 1 30); do
+    if docker exec fiberco-naf-db pg_isready -U app -d fiberco-naf &>/dev/null; then
+        echo "  Database is ready"
+        break
+    fi
+    if [ "$i" -eq 30 ]; then
+        echo "  ERROR: Database did not become healthy after 30 attempts"
+        exit 1
+    fi
+    sleep 2
+done
+
+# ── Restore database ───────────────────────────────────────────────
+echo "[3/5] Restoring database (this may take a while)..."
+docker cp "$SCRIPT_DIR/sql/fiberco-naf.dump" fiberco-naf-db:/tmp/fiberco-naf.dump
+
+docker exec fiberco-naf-db pg_restore -U app -d fiberco-naf \
+    --no-owner --no-privileges \
+    --jobs=4 \
+    /tmp/fiberco-naf.dump || true
+
+docker exec fiberco-naf-db rm /tmp/fiberco-naf.dump
+echo "  Database restored"
+
+# ── Deploy app code ─────────────────────────────────────────────────
+echo "[4/5] Deploying app code..."
+docker cp "$SCRIPT_DIR/app/." fiberco-naf-app:/home/app/code/
+docker exec fiberco-naf-app bash -c "cd /home/app/code && pip install --user fastapi uvicorn psycopg2-binary 2>/dev/null"
+
+# Copy import script for future G-NAF updates
+docker cp "$SCRIPT_DIR/docker/import-gnaf.sh" fiberco-naf-app:/home/app/import-gnaf.sh
+
+echo "  Done"
+
+# ── Verify ──────────────────────────────────────────────────────────
+echo "[5/5] Verifying..."
+ADDR_COUNT=$(docker exec fiberco-naf-db psql -U app -d fiberco-naf -tAc \
+    "SELECT count(*) FROM gnaf.address_detail;" 2>/dev/null || echo "0")
+echo "  Address records: $ADDR_COUNT"
+
+OSP_TABLES=$(docker exec fiberco-naf-db psql -U app -d fiberco-naf -tAc \
+    "SELECT count(*) FROM information_schema.tables WHERE table_schema='osp';" 2>/dev/null || echo "0")
+echo "  OSP tables: $OSP_TABLES"
+
+echo ""
+echo "=== Import Complete ==="
+echo ""
+echo "  App container:  fiberco-naf-app"
+echo "  DB container:   fiberco-naf-db"
+echo "  API endpoint:   http://fiberco-naf-app:3000"
+echo "  Database:       postgres://app:app@fiberco-naf-db:5432/fiberco-naf"
+echo ""
+echo "To start the API:"
+echo "  docker exec fiberco-naf-app bash -c 'cd /home/app/code && python3 -m uvicorn api:app --host 0.0.0.0 --port 3000 &'"
+echo ""
+echo "To set up nginx (if using reverse proxy):"
+echo "  cp nginx/fiberco-naf.conf /path/to/nginx/conf.d/"
+echo ""
+echo "To set up quarterly G-NAF auto-updates:"
+echo "  Edit bin/gnaf-update and update PROJECT_DIR path"
+echo "  Add cron: 0 2 1 */3 * /path/to/bin/gnaf-update >> /var/log/gnaf-update.log 2>&1"
+IMPORT
+
+chmod +x "$EXPORT_DIR/naf-import"
+
+# ── Summary ──────────────────────────────────────────────────────────
+echo ""
+echo "=== Export Complete ==="
+echo ""
+echo "Package: $EXPORT_DIR"
+echo ""
+ls -lh "$EXPORT_DIR/sql/fiberco-naf.dump"
+echo ""
+echo "Contents:"
+find "$EXPORT_DIR" -type f | sort | sed "s|$EXPORT_DIR/|  |"
+echo ""
+echo "To transfer to another VM:"
+echo "  tar czf fiberco-naf-$TIMESTAMP.tar.gz -C $OUTPUT_DIR fiberco-naf-$TIMESTAMP"
+echo "  scp fiberco-naf-$TIMESTAMP.tar.gz user@newvm:/tmp/"
+echo ""
+echo "On the new VM:"
+echo "  tar xzf fiberco-naf-$TIMESTAMP.tar.gz"
+echo "  cd fiberco-naf-$TIMESTAMP"
+echo "  ./naf-import              # joins existing fiberco-internal network"
+echo "  ./naf-import --standalone # creates its own isolated network"
