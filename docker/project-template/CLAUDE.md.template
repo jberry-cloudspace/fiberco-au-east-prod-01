@@ -1,0 +1,49 @@
+# {{PROJECT_DISPLAY_NAME}}
+
+## Project Overview
+{{PROJECT_DESCRIPTION}}
+
+- **Container:** {{PROJECT_NAME}}-app
+- **Database:** {{PROJECT_NAME}}-db (PostgreSQL 16)
+- **Domain:** {{PROJECT_DOMAIN}}
+- **Network:** fiberco-internal (shared with all Fiberco projects)
+
+## Basecamp
+This project uses Basecamp, a structured development methodology.
+- Core playbooks: `basecamp/playbooks/` (from repo root)
+- Fiberco playbooks: `playbooks/` (from repo root)
+- Playbooks are loaded automatically — invoke the Playbook tool before any work.
+
+## Project Tracker
+All work MUST be tracked. Before starting any work:
+1. Run `tracker board --project {{PROJECT_NAME}}` to see current state
+2. If resuming, run `tracker session-handoff {{PROJECT_NAME}}` for context
+3. Create or pick a task, then `tracker session-start <code> "<objective>"`
+4. During work, update session state with decisions, completions, blockers
+5. Before ending, log next steps: `tracker session-update <code> --next "..."`
+
+See `playbooks/project-tracking/PLAYBOOK.md` for full protocol.
+
+## Tools
+| Tool | Usage |
+|------|-------|
+| `project shell {{PROJECT_NAME}}` | Open shell in app container |
+| `project db {{PROJECT_NAME}}` | Open psql in database |
+| `project logs {{PROJECT_NAME}}` | Tail container logs |
+| `tracker board` | View all tracked work |
+| `tracker create "title" --project {{PROJECT_NAME}} --type feature` | Create a task |
+
+## Infrastructure
+- Reverse proxy: nginx on ports 80/443 with Let's Encrypt SSL
+- DNS: Cloudflare A record for {{PROJECT_DOMAIN}}
+- Docker network: `fiberco-internal` for inter-project communication
+- Database is isolated (not on shared network) — only the app container can reach it
+
+## Related Projects
+| Project | Container | Domain |
+|---------|-----------|--------|
+| fiberco-website | fiberco-website-app | fiberco.com.au |
+| fiberco-interact | fiberco-interact-app | interact.fiberco.com.au |
+| fiberco-naf | fiberco-naf-app | naf.fiberco.com.au |
+| fiberco-portal | fiberco-portal-app | portal.fiberco.com.au |
+| fiberco-uploads | fiberco-uploads-app | uploads.fiberco.com.au |

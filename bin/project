@@ -8,6 +8,20 @@ NGINX_DIR="$REPO_ROOT/docker/nginx"
 TRACKER_DIR="$REPO_ROOT/docker/tracker"
 SHARED_NETWORK="fiberco-internal"
 
+render_template() {
+    local template="$1"
+    local project_name="$2"
+    local project_domain="$3"
+    local project_display="$4"
+    local project_desc="${5:-New Fiberco project}"
+
+    sed -e "s|{{PROJECT_NAME}}|${project_name}|g" \
+        -e "s|{{PROJECT_DOMAIN}}|${project_domain}|g" \
+        -e "s|{{PROJECT_DISPLAY_NAME}}|${project_display}|g" \
+        -e "s|{{PROJECT_DESCRIPTION}}|${project_desc}|g" \
+        "$template"
+}
+
 ensure_shared_network() {
     if ! docker network inspect "$SHARED_NETWORK" &>/dev/null; then
         echo "Creating shared internal network '$SHARED_NETWORK'..."
@@ -19,7 +33,8 @@ usage() {
     echo "Usage: project <command> <name> [options]"
     echo ""
     echo "Commands:"
-    echo "  create <name>                 Create a new project container"
+    echo "  create <name> [--domain d] [--description d]"
+    echo "                                Create a new project with CLAUDE.md + nginx"
     echo "  up <name>                     Start a project"
     echo "  down <name>                   Stop a project"
     echo "  shell <name>                  Open a shell in the app container"
@@ -53,12 +68,28 @@ nginx_compose() {
 
 cmd_create() {
     local name="$1"; shift
+    local domain=""
+    local description=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --domain) domain="$2"; shift 2 ;;
+            --description) description="$2"; shift 2 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
 
     local dir="$PROJECTS_DIR/$name"
     if [[ -d "$dir" ]]; then
         echo "Error: Project '$name' already exists at $dir"
         exit 1
     fi
+
+    # Derive defaults
+    local short_name="${name#fiberco-}"
+    domain="${domain:-${short_name}.fiberco.com.au}"
+    description="${description:-New Fiberco project}"
+    local display_name="Fiberco ${short_name^}"
 
     echo "Creating project '$name'..."
     mkdir -p "$dir"
@@ -69,6 +100,19 @@ PROJECT_NAME=$name
 ANTHROPIC_API_KEY=
 EOF
 
+    # Generate CLAUDE.md from template
+    if [[ -f "$TEMPLATE_DIR/CLAUDE.md.template" ]]; then
+        render_template "$TEMPLATE_DIR/CLAUDE.md.template" "$name" "$domain" "$display_name" "$description" > "$dir/CLAUDE.md"
+        echo "  Generated CLAUDE.md with basecamp integration"
+    fi
+
+    # Generate nginx config from template
+    if [[ -f "$TEMPLATE_DIR/nginx.conf.template" ]]; then
+        local nginx_conf="$NGINX_DIR/conf.d/${name}.conf"
+        render_template "$TEMPLATE_DIR/nginx.conf.template" "$name" "$domain" "$display_name" "$description" > "$nginx_conf"
+        echo "  Generated nginx config at docker/nginx/conf.d/${name}.conf"
+    fi
+
     ensure_shared_network
 
     echo "Building and starting containers..."
@@ -78,13 +122,21 @@ EOF
     echo "Project '$name' is running!"
     echo "  App container: ${name}-app"
     echo "  DB container:  ${name}-db (postgres)"
+    echo "  Domain:        ${domain}"
     echo ""
     echo "  Shell:  project shell $name"
     echo "  DB:     project db $name"
     echo "  Logs:   project logs $name"
     echo ""
-    echo "  Set your API key: edit docker/projects/$name/.env"
-    echo "  Add nginx route:  docker/nginx/conf.d/${name}.conf"
+    echo "Remaining setup:"
+    echo "  1. Set API key:       edit docker/projects/$name/.env"
+    echo "  2. Add DNS:           Cloudflare A record for ${domain}"
+    echo "  3. Provision SSL:     bin/renew-certs"
+    echo "  4. Reload nginx:      project nginx-reload"
+    echo "  5. Register tracker:  tracker create \"Initial setup\" --project $name --type change"
+    echo "  6. Update CLAUDE.md:  add project to root CLAUDE.md projects table"
+    echo ""
+    echo "See playbooks/new-project-setup/PLAYBOOK.md for the full checklist."
 }
 
 cmd_up() {
