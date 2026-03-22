@@ -1,72 +1,129 @@
 #!/usr/bin/env bash
-# Export the fiberco-naf project as a portable package for import on another VM
+# Export the NAF address database as a portable package for Hypernet
 # Usage: bin/naf-export [output-dir]
 #
 # Creates a self-contained directory with:
 #   - Database dump (pg_dump, compressed)
 #   - App code from the volume
-#   - Docker compose + config files
-#   - Import script + G-NAF update script
+#   - Docker compose + config files (rebranded hypernet-naf)
+#   - Import script with auto-update cron setup
 #   - nginx config template
-#   - Import/setup instructions
+#   - G-NAF quarterly update script
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUTPUT_DIR="${1:-/tmp/fiberco-naf-export}"
+OUTPUT_DIR="${1:-/tmp/hypernet-naf-export}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-EXPORT_DIR="$OUTPUT_DIR/fiberco-naf-$TIMESTAMP"
+EXPORT_DIR="$OUTPUT_DIR/hypernet-naf-$TIMESTAMP"
 
-echo "=== Fiberco NAF Export ==="
+echo "=== NAF Export for Hypernet ==="
 echo "Output: $EXPORT_DIR"
 echo ""
 
 mkdir -p "$EXPORT_DIR"/{docker,sql,app,nginx,bin}
 
 # ── 1. Database dump ────────────────────────────────────────────────
-echo "[1/6] Dumping database (this may take a while — 22GB+ of data)..."
+echo "[1/7] Dumping database (this may take a while — 22GB+ of data)..."
 docker exec fiberco-naf-db pg_dump -U app -d fiberco-naf \
     --no-owner --no-privileges \
     -Fc -Z 6 \
-    -f /tmp/fiberco-naf-export.dump
+    -f /tmp/naf-export.dump
 
-docker cp fiberco-naf-db:/tmp/fiberco-naf-export.dump "$EXPORT_DIR/sql/fiberco-naf.dump"
-docker exec fiberco-naf-db rm /tmp/fiberco-naf-export.dump
+docker cp fiberco-naf-db:/tmp/naf-export.dump "$EXPORT_DIR/sql/hypernet-naf.dump"
+docker exec fiberco-naf-db rm /tmp/naf-export.dump
 
-DUMP_SIZE=$(ls -lh "$EXPORT_DIR/sql/fiberco-naf.dump" | awk '{print $5}')
+DUMP_SIZE=$(ls -lh "$EXPORT_DIR/sql/hypernet-naf.dump" | awk '{print $5}')
 echo "  Database dump: $DUMP_SIZE"
 
 # ── 2. App code ─────────────────────────────────────────────────────
-echo "[2/6] Extracting app code from volume..."
+echo "[2/7] Extracting app code from volume..."
 docker cp fiberco-naf-app:/home/app/code/. "$EXPORT_DIR/app/"
-# Remove pycache
 rm -rf "$EXPORT_DIR/app/__pycache__"
 echo "  Done."
 
-# ── 3. Docker config ────────────────────────────────────────────────
-echo "[3/6] Copying Docker config..."
-cp "$REPO_ROOT/docker/projects/fiberco-naf/docker-compose.yml" "$EXPORT_DIR/docker/"
-cp "$REPO_ROOT/docker/projects/fiberco-naf/import-gnaf.sh" "$EXPORT_DIR/docker/"
-cp -r "$REPO_ROOT/docker/projects/fiberco-naf/sql" "$EXPORT_DIR/docker/sql"
+# ── 3. Docker compose ──────────────────────────────────────────────
+echo "[3/7] Generating docker-compose.yml..."
+cat > "$EXPORT_DIR/docker/docker-compose.yml" <<'COMPOSE'
+services:
+  app:
+    build:
+      context: ./base
+      args:
+        PROJECT_USER: app
+    container_name: hypernet-naf-app
+    restart: unless-stopped
+    volumes:
+      - app-data:/home/app/code
+    environment:
+      - PROJECT_NAME=hypernet-naf
+      - DATABASE_URL=postgres://app:app@db:5432/hypernet-naf
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - project-net
+      - hypernet-internal
 
-cat > "$EXPORT_DIR/docker/.env" <<'EOF'
-PROJECT_NAME=fiberco-naf
-ANTHROPIC_API_KEY=
-EOF
+  db:
+    image: postgis/postgis:16-3.5-alpine
+    shm_size: '2g'
+    container_name: hypernet-naf-db
+    restart: unless-stopped
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=app
+      - POSTGRES_DB=hypernet-naf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d hypernet-naf"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - project-net
+
+volumes:
+  app-data:
+    name: hypernet-naf-app-data
+  db-data:
+    name: hypernet-naf-db-data
+
+networks:
+  project-net:
+    name: hypernet-naf-net
+  hypernet-internal:
+    external: true
+COMPOSE
 echo "  Done."
 
-# ── 4. Nginx config ─────────────────────────────────────────────────
-echo "[4/6] Generating nginx config..."
-cat > "$EXPORT_DIR/nginx/fiberco-naf.conf" <<'NGINX'
+# ── 4. Import-gnaf script (for future G-NAF data refreshes) ───────
+echo "[4/7] Generating import-gnaf.sh..."
+sed \
+    -e 's/fiberco-naf-db/hypernet-naf-db/g' \
+    -e 's/fiberco-naf/hypernet-naf/g' \
+    -e 's/FiberCo/Hypernet/g' \
+    "$REPO_ROOT/docker/projects/fiberco-naf/import-gnaf.sh" \
+    > "$EXPORT_DIR/docker/import-gnaf.sh"
+chmod +x "$EXPORT_DIR/docker/import-gnaf.sh"
+
+# Copy OSP schema
+cp "$REPO_ROOT/docker/projects/fiberco-naf/sql/001-osp-schema.sql" "$EXPORT_DIR/docker/sql/" 2>/dev/null || true
+echo "  Done."
+
+# ── 5. Nginx config ─────────────────────────────────────────────────
+echo "[5/7] Generating nginx config..."
+cat > "$EXPORT_DIR/nginx/hypernet-naf.conf" <<'NGINX'
 server {
     listen 443 ssl;
-    server_name naf.fiberco.com.au;
+    server_name naf.hypernet.com.au;
 
-    ssl_certificate /etc/letsencrypt/live/naf.fiberco.com.au/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/naf.fiberco.com.au/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/naf.hypernet.com.au/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/naf.hypernet.com.au/privkey.pem;
 
     location / {
-        proxy_pass http://fiberco-naf-app:3000;
+        proxy_pass http://hypernet-naf-app:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -79,49 +136,135 @@ server {
 
 server {
     listen 80;
-    server_name naf.fiberco.com.au;
+    server_name naf.hypernet.com.au;
     return 301 https://$host$request_uri;
 }
 NGINX
 echo "  Done."
 
-# ── 5. G-NAF update script ──────────────────────────────────────────
-echo "[5/6] Copying update scripts..."
-cp "$REPO_ROOT/bin/gnaf-update" "$EXPORT_DIR/bin/"
+# ── 6. G-NAF auto-update script ─────────────────────────────────────
+echo "[6/7] Generating gnaf-update script..."
+cat > "$EXPORT_DIR/bin/gnaf-update" <<'UPDATESCRIPT'
+#!/bin/bash
+# G-NAF Quarterly Auto-Update for Hypernet NAF
+# Checks data.gov.au for a new G-NAF release and imports it if found
+# Installed as cron: 0 2 1 */3 * /opt/hypernet-naf/bin/gnaf-update >> /var/log/gnaf-update.log 2>&1
+set -euo pipefail
+
+# Auto-detect install directory (parent of bin/)
+INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DOWNLOAD_DIR="/tmp/gnaf_update"
+DATASET_ID="19432f89-dc3a-4ef3-b943-5326ef1dbecc"
+API_URL="https://data.gov.au/api/3/action/package_show?id=$DATASET_ID"
+STATE_FILE="$INSTALL_DIR/.gnaf-version"
+
+echo "=== G-NAF Update Check: $(date) ==="
+
+# Get the latest GDA2020 resource URL and last_modified from data.gov.au API
+LATEST_INFO=$(curl -s "$API_URL" | jq -r '
+  .result.resources[]
+  | select(.name | test("GDA2020"; "i"))
+  | select(.format == "ZIP")
+  | {url: .url, modified: .last_modified, name: .name}
+' | head -1)
+
+if [ -z "$LATEST_INFO" ]; then
+  echo "ERROR: Could not fetch dataset info from data.gov.au"
+  exit 1
+fi
+
+LATEST_URL=$(echo "$LATEST_INFO" | jq -r '.url')
+LATEST_MODIFIED=$(echo "$LATEST_INFO" | jq -r '.modified')
+LATEST_NAME=$(echo "$LATEST_INFO" | jq -r '.name')
+
+echo "Latest release: $LATEST_NAME"
+echo "Last modified: $LATEST_MODIFIED"
+echo "URL: $LATEST_URL"
+
+# Check if we already have this version
+if [ -f "$STATE_FILE" ]; then
+  CURRENT_MODIFIED=$(cat "$STATE_FILE")
+  if [ "$CURRENT_MODIFIED" = "$LATEST_MODIFIED" ]; then
+    echo "Already up to date. Skipping."
+    exit 0
+  fi
+  echo "New version available (current: $CURRENT_MODIFIED)"
+else
+  echo "No version file found — treating as first run or forced update"
+fi
+
+# Download
+echo "Downloading G-NAF dataset..."
+mkdir -p "$DOWNLOAD_DIR"
+wget -q --show-progress -O "$DOWNLOAD_DIR/gnaf_latest.zip" "$LATEST_URL"
+
+if [ ! -f "$DOWNLOAD_DIR/gnaf_latest.zip" ]; then
+  echo "ERROR: Download failed"
+  exit 1
+fi
+
+echo "Download complete: $(ls -lh "$DOWNLOAD_DIR/gnaf_latest.zip" | awk '{print $5}')"
+
+# Copy into container and import
+echo "Copying to container..."
+docker exec hypernet-naf-app mkdir -p /home/app/data
+docker cp "$DOWNLOAD_DIR/gnaf_latest.zip" hypernet-naf-app:/home/app/data/gnaf_latest.zip
+docker exec -u root hypernet-naf-app chown app:app /home/app/data/gnaf_latest.zip
+
+echo "Running import (this will replace existing data)..."
+docker exec hypernet-naf-app bash /home/app/import-gnaf.sh /home/app/data/gnaf_latest.zip
+
+# Save version
+echo "$LATEST_MODIFIED" > "$STATE_FILE"
+
+# Cleanup
+rm -rf "$DOWNLOAD_DIR"
+docker exec hypernet-naf-app rm -f /home/app/data/gnaf_latest.zip
+
+# Refresh materialized view
+echo "Refreshing materialized views..."
+docker exec hypernet-naf-db psql -U app -d hypernet-naf -c "REFRESH MATERIALIZED VIEW gnaf.address_lookup;" 2>/dev/null || true
+
+echo "=== G-NAF Update Complete: $(date) ==="
+UPDATESCRIPT
 chmod +x "$EXPORT_DIR/bin/gnaf-update"
 echo "  Done."
 
-# ── 6. Import script ────────────────────────────────────────────────
-echo "[6/6] Generating import script..."
+# ── 7. Import script ────────────────────────────────────────────────
+echo "[7/7] Generating import script..."
 cat > "$EXPORT_DIR/naf-import" <<'IMPORT'
 #!/usr/bin/env bash
-# Import fiberco-naf onto a new VM
-# Usage: ./naf-import [--network NETWORK_NAME] [--standalone]
+# Import hypernet-naf onto a new VM
+# Usage: ./naf-import [--install-dir /opt/hypernet-naf]
 #
-# Modes:
-#   Default:      Joins an existing fiberco-internal network (for multi-project VMs)
-#   --standalone: Creates its own isolated network (for single-service VMs)
-#   --network X:  Joins a custom external network name
+# Sets up:
+#   - Docker network (hypernet-internal)
+#   - App + DB containers
+#   - Restores full database (G-NAF addresses + OSP schema)
+#   - Deploys FastAPI app
+#   - Installs quarterly G-NAF auto-update cron job
+#   - Prints nginx setup instructions
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-NETWORK="fiberco-internal"
-STANDALONE=false
+INSTALL_DIR="/opt/hypernet-naf"
+NETWORK="hypernet-internal"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --install-dir) INSTALL_DIR="$2"; shift 2 ;;
         --network) NETWORK="$2"; shift 2 ;;
-        --standalone) STANDALONE=true; NETWORK="fiberco-naf-standalone"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-echo "=== Fiberco NAF Import ==="
+echo "=== Hypernet NAF Import ==="
+echo "Install dir: $INSTALL_DIR"
 echo ""
 
 # ── Prerequisites ───────────────────────────────────────────────────
-for cmd in docker; do
+for cmd in docker curl jq wget; do
     if ! command -v "$cmd" &>/dev/null; then
         echo "ERROR: $cmd is required but not installed."
         exit 1
@@ -133,8 +276,20 @@ if ! docker compose version &>/dev/null; then
     exit 1
 fi
 
+# ── Install to permanent location ──────────────────────────────────
+echo "[1/7] Installing to $INSTALL_DIR..."
+if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo cp -r "$SCRIPT_DIR"/{docker,bin,nginx} "$INSTALL_DIR/"
+    sudo cp "$SCRIPT_DIR"/naf-import "$INSTALL_DIR/"
+    sudo chown -R "$(id -un):$(id -gn)" "$INSTALL_DIR"
+    echo "  Copied to $INSTALL_DIR"
+else
+    echo "  Already at $INSTALL_DIR"
+fi
+
 # ── Network ─────────────────────────────────────────────────────────
-echo "[1/5] Setting up Docker network '$NETWORK'..."
+echo "[2/7] Setting up Docker network '$NETWORK'..."
 if ! docker network inspect "$NETWORK" &>/dev/null 2>&1; then
     docker network create "$NETWORK"
     echo "  Created network '$NETWORK'"
@@ -142,22 +297,18 @@ else
     echo "  Network '$NETWORK' already exists"
 fi
 
-# Update docker-compose to use the right network name
-if [ "$NETWORK" != "fiberco-internal" ]; then
-    sed -i "s/fiberco-internal/$NETWORK/g" "$SCRIPT_DIR/docker/docker-compose.yml"
+# Update docker-compose if custom network
+if [ "$NETWORK" != "hypernet-internal" ]; then
+    sed -i "s/hypernet-internal/$NETWORK/g" "$INSTALL_DIR/docker/docker-compose.yml"
     echo "  Updated docker-compose.yml to use '$NETWORK'"
 fi
 
-# ── Build base image if needed ──────────────────────────────────────
-echo "[2/5] Preparing containers..."
+# ── Build base image ────────────────────────────────────────────────
+echo "[3/7] Preparing containers..."
+COMPOSE_DIR="$INSTALL_DIR/docker"
 
-# Check if we need a Dockerfile — create a minimal one if the base context isn't available
-COMPOSE_DIR="$SCRIPT_DIR/docker"
-if [ ! -d "$COMPOSE_DIR/../../base" ]; then
-    echo "  Base image context not found — creating standalone Dockerfile..."
-    mkdir -p "$COMPOSE_DIR/base"
-
-    cat > "$COMPOSE_DIR/base/Dockerfile" <<'DOCKERFILE'
+mkdir -p "$COMPOSE_DIR/base"
+cat > "$COMPOSE_DIR/base/Dockerfile" <<'DOCKERFILE'
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
@@ -173,20 +324,16 @@ USER ${PROJECT_USER}
 WORKDIR /home/${PROJECT_USER}/code
 CMD ["sleep", "infinity"]
 DOCKERFILE
+echo "  Created Dockerfile"
 
-    # Point docker-compose build context at our local base
-    sed -i 's|context: ../../base|context: ./base|g' "$COMPOSE_DIR/docker-compose.yml"
-    echo "  Created standalone Dockerfile"
-fi
-
-# Start containers (db first for health check)
-docker compose -f "$COMPOSE_DIR/docker-compose.yml" --env-file "$COMPOSE_DIR/.env" up -d --build
+# Start containers
+docker compose -f "$COMPOSE_DIR/docker-compose.yml" up -d --build
 echo "  Containers started"
 
-# Wait for database to be healthy
-echo "  Waiting for database to be healthy..."
+# Wait for database
+echo "  Waiting for database..."
 for i in $(seq 1 30); do
-    if docker exec fiberco-naf-db pg_isready -U app -d fiberco-naf &>/dev/null; then
+    if docker exec hypernet-naf-db pg_isready -U app -d hypernet-naf &>/dev/null; then
         echo "  Database is ready"
         break
     fi
@@ -198,54 +345,65 @@ for i in $(seq 1 30); do
 done
 
 # ── Restore database ───────────────────────────────────────────────
-echo "[3/5] Restoring database (this may take a while)..."
-docker cp "$SCRIPT_DIR/sql/fiberco-naf.dump" fiberco-naf-db:/tmp/fiberco-naf.dump
+echo "[4/7] Restoring database (this may take a while)..."
+docker cp "$SCRIPT_DIR/sql/hypernet-naf.dump" hypernet-naf-db:/tmp/hypernet-naf.dump
 
-docker exec fiberco-naf-db pg_restore -U app -d fiberco-naf \
+docker exec hypernet-naf-db pg_restore -U app -d hypernet-naf \
     --no-owner --no-privileges \
     --jobs=4 \
-    /tmp/fiberco-naf.dump || true
+    /tmp/hypernet-naf.dump || true
 
-docker exec fiberco-naf-db rm /tmp/fiberco-naf.dump
+docker exec hypernet-naf-db rm /tmp/hypernet-naf.dump
 echo "  Database restored"
 
 # ── Deploy app code ─────────────────────────────────────────────────
-echo "[4/5] Deploying app code..."
-docker cp "$SCRIPT_DIR/app/." fiberco-naf-app:/home/app/code/
-docker exec fiberco-naf-app bash -c "cd /home/app/code && pip install --user fastapi uvicorn psycopg2-binary 2>/dev/null"
+echo "[5/7] Deploying app code..."
+docker cp "$SCRIPT_DIR/app/." hypernet-naf-app:/home/app/code/
+docker exec hypernet-naf-app bash -c "cd /home/app/code && pip install --user fastapi uvicorn psycopg2-binary 2>/dev/null"
 
 # Copy import script for future G-NAF updates
-docker cp "$SCRIPT_DIR/docker/import-gnaf.sh" fiberco-naf-app:/home/app/import-gnaf.sh
-
+docker cp "$INSTALL_DIR/docker/import-gnaf.sh" hypernet-naf-app:/home/app/import-gnaf.sh
 echo "  Done"
 
+# ── Install auto-update cron ────────────────────────────────────────
+echo "[6/7] Installing G-NAF auto-update cron job..."
+CRON_CMD="0 2 1 */3 * $INSTALL_DIR/bin/gnaf-update >> /var/log/gnaf-update.log 2>&1"
+
+# Add cron job if not already present
+(crontab -l 2>/dev/null || true) | grep -v "gnaf-update" | { cat; echo "$CRON_CMD"; } | crontab -
+echo "  Cron installed: quarterly check on 1st of Jan/Apr/Jul/Oct at 2am"
+echo "  Logs: /var/log/gnaf-update.log"
+
 # ── Verify ──────────────────────────────────────────────────────────
-echo "[5/5] Verifying..."
-ADDR_COUNT=$(docker exec fiberco-naf-db psql -U app -d fiberco-naf -tAc \
+echo "[7/7] Verifying..."
+ADDR_COUNT=$(docker exec hypernet-naf-db psql -U app -d hypernet-naf -tAc \
     "SELECT count(*) FROM gnaf.address_detail;" 2>/dev/null || echo "0")
 echo "  Address records: $ADDR_COUNT"
 
-OSP_TABLES=$(docker exec fiberco-naf-db psql -U app -d fiberco-naf -tAc \
+OSP_TABLES=$(docker exec hypernet-naf-db psql -U app -d hypernet-naf -tAc \
     "SELECT count(*) FROM information_schema.tables WHERE table_schema='osp';" 2>/dev/null || echo "0")
 echo "  OSP tables: $OSP_TABLES"
 
 echo ""
 echo "=== Import Complete ==="
 echo ""
-echo "  App container:  fiberco-naf-app"
-echo "  DB container:   fiberco-naf-db"
-echo "  API endpoint:   http://fiberco-naf-app:3000"
-echo "  Database:       postgres://app:app@fiberco-naf-db:5432/fiberco-naf"
+echo "  Install dir:    $INSTALL_DIR"
+echo "  App container:  hypernet-naf-app"
+echo "  DB container:   hypernet-naf-db"
+echo "  API endpoint:   http://hypernet-naf-app:3000"
+echo "  Database:       postgres://app:app@hypernet-naf-db:5432/hypernet-naf"
+echo "  Auto-updates:   quarterly via cron (bin/gnaf-update)"
 echo ""
 echo "To start the API:"
-echo "  docker exec fiberco-naf-app bash -c 'cd /home/app/code && python3 -m uvicorn api:app --host 0.0.0.0 --port 3000 &'"
+echo "  docker exec hypernet-naf-app bash -c 'cd /home/app/code && python3 -m uvicorn api:app --host 0.0.0.0 --port 3000 &'"
 echo ""
-echo "To set up nginx (if using reverse proxy):"
-echo "  cp nginx/fiberco-naf.conf /path/to/nginx/conf.d/"
+echo "To set up nginx:"
+echo "  sudo cp $INSTALL_DIR/nginx/hypernet-naf.conf /etc/nginx/sites-enabled/"
+echo "  # Update domain in config if needed"
+echo "  sudo nginx -t && sudo systemctl reload nginx"
 echo ""
-echo "To set up quarterly G-NAF auto-updates:"
-echo "  Edit bin/gnaf-update and update PROJECT_DIR path"
-echo "  Add cron: 0 2 1 */3 * /path/to/bin/gnaf-update >> /var/log/gnaf-update.log 2>&1"
+echo "To manually trigger a G-NAF update:"
+echo "  $INSTALL_DIR/bin/gnaf-update"
 IMPORT
 
 chmod +x "$EXPORT_DIR/naf-import"
@@ -254,19 +412,18 @@ chmod +x "$EXPORT_DIR/naf-import"
 echo ""
 echo "=== Export Complete ==="
 echo ""
-echo "Package: $EXPORT_DIR"
-echo ""
-ls -lh "$EXPORT_DIR/sql/fiberco-naf.dump"
+ls -lh "$EXPORT_DIR/sql/hypernet-naf.dump"
 echo ""
 echo "Contents:"
 find "$EXPORT_DIR" -type f | sort | sed "s|$EXPORT_DIR/|  |"
 echo ""
-echo "To transfer to another VM:"
-echo "  tar czf fiberco-naf-$TIMESTAMP.tar.gz -C $OUTPUT_DIR fiberco-naf-$TIMESTAMP"
-echo "  scp fiberco-naf-$TIMESTAMP.tar.gz user@newvm:/tmp/"
+echo "To transfer to the Hypernet VM:"
+echo "  tar czf hypernet-naf-$TIMESTAMP.tar.gz -C $OUTPUT_DIR hypernet-naf-$TIMESTAMP"
+echo "  scp hypernet-naf-$TIMESTAMP.tar.gz user@hypernet-vm:/tmp/"
 echo ""
-echo "On the new VM:"
-echo "  tar xzf fiberco-naf-$TIMESTAMP.tar.gz"
-echo "  cd fiberco-naf-$TIMESTAMP"
-echo "  ./naf-import              # joins existing fiberco-internal network"
-echo "  ./naf-import --standalone # creates its own isolated network"
+echo "On the Hypernet VM:"
+echo "  tar xzf hypernet-naf-$TIMESTAMP.tar.gz"
+echo "  cd hypernet-naf-$TIMESTAMP"
+echo "  ./naf-import"
+echo ""
+echo "That's it — database, API, auto-updates, everything."
