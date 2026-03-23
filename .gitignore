@@ -9,3 +9,6 @@ docker/projects/*/.env
 
 # Basecamp is its own repo (jberry-cloudspace/basecamp-code)
 basecamp/
+
+# Large database dumps
+*.dump
