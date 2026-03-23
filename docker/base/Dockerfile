@@ -57,7 +57,7 @@ RUN chmod +x /usr/local/bin/tracker
 
 # Create non-root user home structure
 USER ${PROJECT_USER}
-RUN git clone https://github.com/obra/superpowers.git /home/${PROJECT_USER}/.superpowers
+RUN mkdir -p /home/${PROJECT_USER}/.basecamp
 
 # Tracker environment
 ENV TRACKER_DB_HOST=fiberco-tracker-db

@@ -6,6 +6,13 @@ INSERT INTO projects (name, display_name, container_name, domain, description) V
     ('fiberco-portal', 'FiberCo Portal', 'fiberco-portal-app', 'portal.fiberco.com.au', 'Partner portal — service ordering, subscription management for clients and partners'),
     ('infrastructure', 'Infrastructure', NULL, NULL, 'Host VM, Docker, nginx, tracker — cross-cutting infrastructure tasks');
 
+-- Seed initial tasks
+INSERT INTO tasks (code, title, project_id, type, status, priority) VALUES
+    ('FTR-V7KM3X', 'Build FiberCo public website', (SELECT id FROM projects WHERE name = 'fiberco-website'), 'feature', 'in_progress', 'p1'),
+    ('FTR-Q4NW8R', 'Import G-NAF dataset', (SELECT id FROM projects WHERE name = 'fiberco-naf'), 'feature', 'backlog', 'p1'),
+    ('FTR-J2DP5Y', 'Set up Interact platform scaffolding', (SELECT id FROM projects WHERE name = 'fiberco-interact'), 'feature', 'backlog', 'p2'),
+    ('FTR-H9BT6L', 'Build partner portal authentication', (SELECT id FROM projects WHERE name = 'fiberco-portal'), 'feature', 'backlog', 'p2');
+
 -- Seed common labels
 INSERT INTO labels (name, color) VALUES
     ('security', '#EF4444'),

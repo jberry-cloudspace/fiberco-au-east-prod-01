@@ -1,0 +1,11 @@
+#!/bin/bash
+# Renew Let's Encrypt certs and reload nginx
+# Runs via cron twice daily as recommended by Let's Encrypt
+
+set -euo pipefail
+
+COMPOSE_FILE="/home/ubuntu/fiberco-au-east-prod-01/docker/nginx/docker-compose.yml"
+
+docker compose -f "$COMPOSE_FILE" run --rm --entrypoint "certbot renew --quiet" certbot
+
+docker exec fiberco-nginx nginx -s reload

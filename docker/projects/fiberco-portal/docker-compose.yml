@@ -23,7 +23,8 @@ services:
       - fiberco-internal
 
   db:
-    image: postgres:16-alpine
+    image: postgis/postgis:16-3.5-alpine
+    shm_size: '1g'
     container_name: ${PROJECT_NAME:-myproject}-db
     restart: unless-stopped
     volumes:

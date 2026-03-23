@@ -1,0 +1,81 @@
+#!/bin/bash
+# G-NAF Quarterly Auto-Update for Hypernet NAF
+# Checks data.gov.au for a new G-NAF release and imports it if found
+# Installed as cron: 0 2 1 */3 * /opt/hypernet-naf/bin/gnaf-update >> /var/log/gnaf-update.log 2>&1
+set -euo pipefail
+
+# Auto-detect install directory (parent of bin/)
+INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+DOWNLOAD_DIR="/tmp/gnaf_update"
+DATASET_ID="19432f89-dc3a-4ef3-b943-5326ef1dbecc"
+API_URL="https://data.gov.au/api/3/action/package_show?id=$DATASET_ID"
+STATE_FILE="$INSTALL_DIR/.gnaf-version"
+
+echo "=== G-NAF Update Check: $(date) ==="
+
+# Get the latest GDA2020 resource URL and last_modified from data.gov.au API
+LATEST_INFO=$(curl -s "$API_URL" | jq -r '
+  .result.resources[]
+  | select(.name | test("GDA2020"; "i"))
+  | select(.format == "ZIP")
+  | {url: .url, modified: .last_modified, name: .name}
+' | head -1)
+
+if [ -z "$LATEST_INFO" ]; then
+  echo "ERROR: Could not fetch dataset info from data.gov.au"
+  exit 1
+fi
+
+LATEST_URL=$(echo "$LATEST_INFO" | jq -r '.url')
+LATEST_MODIFIED=$(echo "$LATEST_INFO" | jq -r '.modified')
+LATEST_NAME=$(echo "$LATEST_INFO" | jq -r '.name')
+
+echo "Latest release: $LATEST_NAME"
+echo "Last modified: $LATEST_MODIFIED"
+echo "URL: $LATEST_URL"
+
+# Check if we already have this version
+if [ -f "$STATE_FILE" ]; then
+  CURRENT_MODIFIED=$(cat "$STATE_FILE")
+  if [ "$CURRENT_MODIFIED" = "$LATEST_MODIFIED" ]; then
+    echo "Already up to date. Skipping."
+    exit 0
+  fi
+  echo "New version available (current: $CURRENT_MODIFIED)"
+else
+  echo "No version file found — treating as first run or forced update"
+fi
+
+# Download
+echo "Downloading G-NAF dataset..."
+mkdir -p "$DOWNLOAD_DIR"
+wget -q --show-progress -O "$DOWNLOAD_DIR/gnaf_latest.zip" "$LATEST_URL"
+
+if [ ! -f "$DOWNLOAD_DIR/gnaf_latest.zip" ]; then
+  echo "ERROR: Download failed"
+  exit 1
+fi
+
+echo "Download complete: $(ls -lh "$DOWNLOAD_DIR/gnaf_latest.zip" | awk '{print $5}')"
+
+# Copy into container and import
+echo "Copying to container..."
+docker exec hypernet-naf-app mkdir -p /home/app/data
+docker cp "$DOWNLOAD_DIR/gnaf_latest.zip" hypernet-naf-app:/home/app/data/gnaf_latest.zip
+docker exec -u root hypernet-naf-app chown app:app /home/app/data/gnaf_latest.zip
+
+echo "Running import (this will replace existing data)..."
+docker exec hypernet-naf-app bash /home/app/import-gnaf.sh /home/app/data/gnaf_latest.zip
+
+# Save version
+echo "$LATEST_MODIFIED" > "$STATE_FILE"
+
+# Cleanup
+rm -rf "$DOWNLOAD_DIR"
+docker exec hypernet-naf-app rm -f /home/app/data/gnaf_latest.zip
+
+# Refresh materialized view
+echo "Refreshing materialized views..."
+docker exec hypernet-naf-db psql -U app -d hypernet-naf -c "REFRESH MATERIALIZED VIEW gnaf.address_lookup;" 2>/dev/null || true
+
+echo "=== G-NAF Update Complete: $(date) ==="

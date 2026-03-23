@@ -9,6 +9,15 @@ description: Use when starting any work session, completing tasks, encountering 
 
 All work MUST be tracked in the FiberCo tracker database via `tracker` CLI. This enables session continuity — if a session drops, the next session can resume by reading the tracker state.
 
+## Task Code Format
+
+Task codes use a type prefix with a random 6-character alphanumeric ID:
+- **FTR-XXXXXX** for features (type=feature)
+- **BUG-XXXXXX** for bugs (type=bug)
+- **TSK-XXXXXX** for changes (type=change)
+
+Examples: `FTR-V7KM3X`, `BUG-Q4NW8R`, `TSK-J2DP5Y`
+
 ## Iron Law
 
 **NO WORK WITHOUT A TRACKED TASK.**
@@ -47,7 +56,7 @@ Before ending a session (or if you sense it may drop):
 tracker create "Task title" --project fiberco-website --type feature --priority p1
 ```
 
-Types: `feature`, `bug`, `change`
+Types: `feature` (FTR-), `bug` (BUG-), `change` (TSK-)
 Priorities: `p0` (urgent), `p1` (high), `p2` (medium), `p3` (low)
 Projects: `fiberco-website`, `fiberco-interact`, `fiberco-naf`, `fiberco-portal`, `infrastructure`
 
@@ -65,17 +74,17 @@ When asked "what were we working on?" or starting a new session:
 ```bash
 tracker board                                    # See everything
 tracker session-handoff fiberco-website          # Get handoff for a project
-tracker session-handoff FIB-0001                 # Get handoff for a specific task
+tracker session-handoff FTR-V7KM3X              # Get handoff for a specific task
 ```
 
 ## Status Flow
 
 ```
-triage → backlog → todo → in_progress → in_review → done
-                                    ↘ cancelled
+triage -> backlog -> todo -> in_progress -> in_review -> done
+                                       \-> cancelled
 ```
 
-## Red Flags — STOP
+## Red Flags -- STOP
 
 - Starting work without running `tracker board` first
 - Writing code without a task code

@@ -1,8 +1,5 @@
 -- FiberCo Project Tracker Schema
 
--- Sequences
-CREATE SEQUENCE task_code_seq START 1;
-
 -- Enums
 CREATE TYPE task_type AS ENUM ('feature', 'bug', 'change');
 CREATE TYPE task_status AS ENUM ('triage', 'backlog', 'todo', 'in_progress', 'in_review', 'done', 'cancelled');
@@ -46,7 +43,7 @@ CREATE TABLE labels (
 -- Tasks (core tickets)
 CREATE TABLE tasks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code TEXT NOT NULL UNIQUE DEFAULT 'FIB-' || LPAD(nextval('task_code_seq')::TEXT, 4, '0'),
+    code TEXT NOT NULL UNIQUE,
     parent_id UUID REFERENCES tasks(id),
     epic_id UUID REFERENCES epics(id),
     project_id UUID REFERENCES projects(id),

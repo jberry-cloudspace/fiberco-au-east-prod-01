@@ -6,3 +6,6 @@ docker/projects/*/.env
 
 # Keep the projects directory structure
 !docker/projects/.gitkeep
+
+# Basecamp is its own repo (jberry-cloudspace/basecamp-code)
+basecamp/

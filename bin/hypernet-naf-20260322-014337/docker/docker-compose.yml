@@ -1,0 +1,50 @@
+services:
+  app:
+    build:
+      context: ./base
+      args:
+        PROJECT_USER: app
+    container_name: hypernet-naf-app
+    restart: unless-stopped
+    volumes:
+      - app-data:/home/app/code
+    environment:
+      - PROJECT_NAME=hypernet-naf
+      - DATABASE_URL=postgres://app:app@db:5432/hypernet-naf
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - project-net
+      - hypernet-internal
+
+  db:
+    image: postgis/postgis:16-3.5-alpine
+    shm_size: '2g'
+    container_name: hypernet-naf-db
+    restart: unless-stopped
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=app
+      - POSTGRES_PASSWORD=app
+      - POSTGRES_DB=hypernet-naf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d hypernet-naf"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - project-net
+
+volumes:
+  app-data:
+    name: hypernet-naf-app-data
+  db-data:
+    name: hypernet-naf-db-data
+
+networks:
+  project-net:
+    name: hypernet-naf-net
+  hypernet-internal:
+    external: true
